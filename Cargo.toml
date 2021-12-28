@@ -20,6 +20,7 @@ members = [
 ]
 
 [dependencies]
+rustyline = "9.1.1"
 reedline = { git = "https://github.com/nushell/reedline", branch = "main" }
 crossterm = "0.22.*"
 dialoguer = "0.9.0"

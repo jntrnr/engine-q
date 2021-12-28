@@ -6,6 +6,7 @@ use dialoguer::{
     Select,
 };
 use miette::{IntoDiagnostic, Result};
+use nu_ansi_term::Color;
 use nu_cli::{CliError, NuCompleter, NuHighlighter, NuValidator, NushellPrompt};
 use nu_color_config::get_color_config;
 use nu_command::create_default_context;
@@ -17,7 +18,12 @@ use nu_protocol::{
     Config, PipelineData, ShellError, Span, Value, CONFIG_VARIABLE_ID,
 };
 use reedline::{
-    Completer, CompletionActionHandler, DefaultHinter, DefaultPrompt, LineBuffer, Prompt, Vi,
+    Completer, CompletionActionHandler, DefaultHinter, DefaultPrompt, Highlighter, LineBuffer,
+    Prompt, Vi,
+};
+use rustyline::{
+    config::Configurer, Cmd, ColorMode, CompletionType, Config as RustylineConfig, Editor,
+    EventHandler, KeyCode, Modifiers, Movement, Word,
 };
 use std::{
     io::Write,
@@ -83,6 +89,107 @@ impl CompletionActionHandler for FuzzyCompletion {
             }
         }
     }
+}
+
+pub struct Helper {
+    completer: NuCompleter,
+    hinter: Option<rustyline::hint::HistoryHinter>,
+    highlighter: NuHighlighter,
+    validator: NuValidator,
+}
+
+pub struct Suggestion {
+    pub display: String,
+    pub replacement: String,
+}
+
+impl rustyline::completion::Candidate for Suggestion {
+    fn display(&self) -> &str {
+        &self.display
+    }
+
+    fn replacement(&self) -> &str {
+        &self.replacement
+    }
+}
+
+impl rustyline::validate::Validator for Helper {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        let _ = ctx;
+        Ok(rustyline::validate::ValidationResult::Valid(None))
+    }
+
+    fn validate_while_typing(&self) -> bool {
+        false
+    }
+}
+
+impl rustyline::highlight::Highlighter for Helper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        let highlighted = self.highlighter.highlight(line);
+
+        let mut output = String::new();
+
+        for (style, string) in &highlighted.buffer {
+            output.push_str(&style.paint(string).to_string());
+        }
+
+        std::borrow::Cow::Owned(output)
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        std::borrow::Cow::Owned(
+            Color::DarkGray.prefix().to_string() + hint + nu_ansi_term::ansi::RESET,
+        )
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize) -> bool {
+        true
+    }
+}
+
+impl rustyline::completion::Completer for Helper {
+    type Candidate = Suggestion;
+}
+
+impl rustyline::hint::Hinter for Helper {
+    type Hint = String;
+}
+
+impl rustyline::Helper for Helper {}
+
+pub fn default_rustyline_editor_configuration() -> Editor<Helper> {
+    #[cfg(windows)]
+    const DEFAULT_COMPLETION_MODE: CompletionType = CompletionType::Circular;
+    #[cfg(not(windows))]
+    const DEFAULT_COMPLETION_MODE: CompletionType = CompletionType::List;
+
+    let config = RustylineConfig::builder()
+        .check_cursor_position(true)
+        .color_mode(ColorMode::Forced)
+        .history_ignore_dups(false)
+        .max_history_size(10_000)
+        .build();
+    let mut rl: Editor<_> = Editor::with_config(config);
+
+    // Let's set the defaults up front and then override them later if the user indicates
+    // defaults taken from here https://github.com/kkawakam/rustyline/blob/2fe886c9576c1ea13ca0e5808053ad491a6fe049/src/config.rs#L150-L167
+    rl.set_max_history_size(100);
+    rl.set_history_ignore_dups(true);
+    rl.set_history_ignore_space(false);
+    rl.set_completion_type(DEFAULT_COMPLETION_MODE);
+    rl.set_completion_prompt_limit(100);
+    rl.set_keyseq_timeout(-1);
+    rl.set_edit_mode(rustyline::config::EditMode::Emacs);
+    rl.set_auto_add_history(false);
+    rl.set_bell_style(rustyline::config::BellStyle::default());
+    rl.set_color_mode(rustyline::ColorMode::Enabled);
+    rl.set_tab_stop(8);
+
+    rl
 }
 
 fn main() -> Result<()> {
@@ -342,60 +449,74 @@ fn main() -> Result<()> {
             //Reset the ctrl-c handler
             ctrlc.store(false, Ordering::SeqCst);
 
-            let line_editor = Reedline::create()
-                .into_diagnostic()?
-                .with_completion_action_handler(Box::new(FuzzyCompletion {
-                    completer: Box::new(NuCompleter::new(engine_state.clone())),
-                }))
-                .with_highlighter(Box::new(NuHighlighter {
+            // let color_hm = get_color_config(&config);
+
+            let mut line_editor = default_rustyline_editor_configuration();
+
+            line_editor.set_helper(Some(Helper {
+                validator: NuValidator {
                     engine_state: engine_state.clone(),
-                    config: config.clone(),
-                }))
-                .with_animation(config.animate_prompt)
-                // .with_completion_action_handler(Box::new(
-                //     ListCompletionHandler::default().with_completer(Box::new(completer)),
-                // ))
-                .with_validator(Box::new(NuValidator {
+                },
+                completer: NuCompleter::new(engine_state.clone()),
+                highlighter: NuHighlighter {
+                    config,
                     engine_state: engine_state.clone(),
-                }))
-                .with_ansi_colors(config.use_ansi_coloring);
+                },
+                hinter: Some(rustyline::hint::HistoryHinter {}),
+            }));
+
+            // let line_editor = Reedline::create()
+            //     .into_diagnostic()?
+            //     .with_completion_action_handler(Box::new(FuzzyCompletion {
+            //         completer: Box::new(NuCompleter::new(engine_state.clone())),
+            //     }))
+            //     .with_highlighter(Box::new(NuHighlighter {
+            //         engine_state: engine_state.clone(),
+            //         config: config.clone(),
+            //     }))
+            //     .with_animation(config.animate_prompt)
+            //     // .with_completion_action_handler(Box::new(
+            //     //     ListCompletionHandler::default().with_completer(Box::new(completer)),
+            //     // ))
+            //     .with_validator(Box::new(NuValidator {
+            //         engine_state: engine_state.clone(),
+            //     }))
+            //     .with_ansi_colors(config.use_ansi_coloring);
             //FIXME: if config.use_ansi_coloring is false then we should
             // turn off the hinter but I don't see any way to do that yet.
 
-            let color_hm = get_color_config(&config);
-
-            let line_editor = if let Some(history_path) = history_path.clone() {
-                let history = std::fs::read_to_string(&history_path);
-                if history.is_ok() {
-                    line_editor
-                        .with_hinter(Box::new(
-                            DefaultHinter::default()
-                                .with_history()
-                                .with_style(color_hm["hints"]),
-                        ))
-                        .with_history(Box::new(
-                            FileBackedHistory::with_file(
-                                config.max_history_size as usize,
-                                history_path.clone(),
-                            )
-                            .into_diagnostic()?,
-                        ))
-                        .into_diagnostic()?
-                } else {
-                    line_editor
-                }
-            } else {
-                line_editor
-            };
+            // let line_editor = if let Some(history_path) = history_path.clone() {
+            //     let history = std::fs::read_to_string(&history_path);
+            //     if history.is_ok() {
+            //         line_editor
+            //             .with_hinter(Box::new(
+            //                 DefaultHinter::default()
+            //                     .with_history()
+            //                     .with_style(color_hm["hints"]),
+            //             ))
+            //             .with_history(Box::new(
+            //                 FileBackedHistory::with_file(
+            //                     config.max_history_size as usize,
+            //                     history_path.clone(),
+            //                 )
+            //                 .into_diagnostic()?,
+            //             ))
+            //             .into_diagnostic()?
+            //     } else {
+            //         line_editor
+            //     }
+            // } else {
+            //     line_editor
+            // };
 
             // The line editor default mode is emacs mode. For the moment we only
             // need to check for vi mode
-            let mut line_editor = if config.edit_mode == "vi" {
-                let edit_mode = Box::new(Vi::default());
-                line_editor.with_edit_mode(edit_mode)
-            } else {
-                line_editor
-            };
+            // let mut line_editor = if config.edit_mode == "vi" {
+            //     let edit_mode = Box::new(Vi::default());
+            //     line_editor.with_edit_mode(edit_mode)
+            // } else {
+            //     line_editor
+            // };
 
             let prompt = update_prompt(
                 PROMPT_COMMAND,
@@ -407,9 +528,11 @@ fn main() -> Result<()> {
 
             entry_num += 1;
 
-            let input = line_editor.read_line(prompt);
+            // let input = line_editor.read_line(prompt);
+            let input = line_editor.readline("> ");
             match input {
-                Ok(Signal::Success(mut s)) => {
+                //Ok(Signal::Success(mut s)) => {
+                Ok(mut s) => {
                     // Check if this is a single call to a directory, if so auto-cd
                     let path = nu_path::expand_path(&s);
                     let orig = s.clone();
@@ -445,17 +568,17 @@ fn main() -> Result<()> {
                         &format!("entry #{}", entry_num),
                     );
                 }
-                Ok(Signal::CtrlC) => {
-                    // `Reedline` clears the line content. New prompt is shown
-                }
-                Ok(Signal::CtrlD) => {
-                    // When exiting clear to a new line
-                    println!();
-                    break;
-                }
-                Ok(Signal::CtrlL) => {
-                    line_editor.clear_screen().into_diagnostic()?;
-                }
+                // Ok(Signal::CtrlC) => {
+                //     // `Reedline` clears the line content. New prompt is shown
+                // }
+                // Ok(Signal::CtrlD) => {
+                //     // When exiting clear to a new line
+                //     println!();
+                //     break;
+                // }
+                // Ok(Signal::CtrlL) => {
+                //     // line_editor.clear_screen().into_diagnostic()?;
+                // }
                 Err(err) => {
                     let message = err.to_string();
                     if !message.contains("duration") {
