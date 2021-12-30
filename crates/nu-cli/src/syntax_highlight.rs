@@ -3,26 +3,15 @@ use nu_color_config::get_shape_color;
 use nu_parser::{flatten_block, parse, FlatShape};
 use nu_protocol::engine::{EngineState, StateWorkingSet};
 use nu_protocol::Config;
-// use reedline::Highlighter;
-
-#[derive(Default, Debug)]
-pub struct StyledText {
-    pub buffer: Vec<(Style, String)>,
-}
-
-impl StyledText {
-    pub fn push(&mut self, item: (Style, String)) {
-        self.buffer.push(item)
-    }
-}
+use reedline::{Highlighter, StyledText};
 
 pub struct NuHighlighter {
     pub engine_state: EngineState,
     pub config: Config,
 }
 
-impl NuHighlighter {
-    pub fn highlight(&self, line: &str) -> StyledText {
+impl Highlighter for NuHighlighter {
+    fn highlight(&self, line: &str) -> StyledText {
         let (shapes, global_span_offset) = {
             let mut working_set = StateWorkingSet::new(&self.engine_state);
             let (block, _) = parse(&mut working_set, None, line.as_bytes(), false);

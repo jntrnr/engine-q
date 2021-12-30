@@ -19,7 +19,7 @@ use nu_protocol::{
 };
 use reedline::{
     Completer, CompletionActionHandler, DefaultHinter, DefaultPrompt, Highlighter, LineBuffer,
-    Prompt, Vi,
+    Prompt, PromptEditMode, Vi,
 };
 use rustyline::{
     config::Configurer, Cmd, ColorMode, CompletionType, Config as RustylineConfig, Editor,
@@ -118,12 +118,22 @@ impl rustyline::validate::Validator for Helper {
         &self,
         ctx: &mut rustyline::validate::ValidationContext,
     ) -> rustyline::Result<rustyline::validate::ValidationResult> {
-        let _ = ctx;
-        Ok(rustyline::validate::ValidationResult::Valid(None))
+        use reedline::Validator;
+
+        let line = ctx.input();
+
+        match self.validator.validate(line) {
+            reedline::ValidationResult::Complete => {
+                Ok(rustyline::validate::ValidationResult::Valid(None))
+            }
+            reedline::ValidationResult::Incomplete => {
+                Ok(rustyline::validate::ValidationResult::Incomplete)
+            }
+        }
     }
 
     fn validate_while_typing(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -153,10 +163,46 @@ impl rustyline::highlight::Highlighter for Helper {
 
 impl rustyline::completion::Completer for Helper {
     type Candidate = Suggestion;
+
+    fn complete(
+        &self, // FIXME should be `&mut self`
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        // let ctx = CompletionContext(&self.context);
+        // let (position, suggestions) = self.completer.complete(line, pos, &ctx);
+        let suggestions = self.completer.complete(line, pos);
+        let mut pos = pos;
+        let suggestions = suggestions
+            .into_iter()
+            .map(|(span, s)| {
+                pos = span.start;
+                Suggestion {
+                    display: s.clone(),
+                    replacement: s,
+                }
+            })
+            .collect();
+        Ok((pos, suggestions))
+    }
+
+    fn update(&self, line: &mut rustyline::line_buffer::LineBuffer, start: usize, elected: &str) {
+        let end = line.pos();
+        line.replace(start..end, elected)
+    }
 }
 
 impl rustyline::hint::Hinter for Helper {
     type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
+        if let Some(hinter) = &self.hinter {
+            hinter.hint(line, pos, ctx)
+        } else {
+            None
+        }
+    }
 }
 
 impl rustyline::Helper for Helper {}
@@ -190,6 +236,33 @@ pub fn default_rustyline_editor_configuration() -> Editor<Helper> {
     rl.set_tab_stop(8);
 
     rl
+}
+
+fn current_branch() -> String {
+    #[cfg(feature = "shadow-rs")]
+    {
+        Some(shadow_rs::branch())
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .map(|x| format!("({})", x))
+            .unwrap_or_default()
+    }
+    #[cfg(not(feature = "shadow-rs"))]
+    {
+        "".to_string()
+    }
+}
+
+fn default_prompt_string(cwd: &str) -> String {
+    format!(
+        "{}{}{}{}{}{}> ",
+        Color::Green.bold().prefix().to_string(),
+        cwd,
+        nu_ansi_term::ansi::RESET,
+        Color::Cyan.bold().prefix().to_string(),
+        current_branch(),
+        nu_ansi_term::ansi::RESET
+    )
 }
 
 fn main() -> Result<()> {
@@ -402,20 +475,37 @@ fn main() -> Result<()> {
             report_error(&working_set, &e);
         }
 
-        let history_path = nu_path::config_dir().and_then(|mut history_path| {
-            history_path.push("nushell");
-            history_path.push("history.txt");
+        // let history_path = nu_path::config_dir().and_then(|mut history_path| {
+        //     history_path.push("nushell");
+        //     history_path.push("history.txt");
 
-            if !history_path.exists() {
-                // Creating an empty file to store the history
-                match std::fs::File::create(&history_path) {
-                    Ok(_) => Some(history_path),
-                    Err(_) => None,
+        //     if !history_path.exists() {
+        //         // Creating an empty file to store the history
+        //         match std::fs::File::create(&history_path) {
+        //             Ok(_) => Some(history_path),
+        //             Err(_) => None,
+        //         }
+        //     } else {
+        //         Some(history_path)
+        //     }
+        // });
+
+        let history_path = nu_path::config_dir()
+            .and_then(|mut history_path| {
+                history_path.push("nushell");
+                history_path.push("history.rusty");
+
+                if !history_path.exists() {
+                    // Creating an empty file to store the history
+                    match std::fs::File::create(&history_path) {
+                        Ok(_) => Some(history_path),
+                        Err(_) => None,
+                    }
+                } else {
+                    Some(history_path)
                 }
-            } else {
-                Some(history_path)
-            }
-        });
+            })
+            .expect("can't create history");
 
         #[cfg(feature = "plugin")]
         {
@@ -464,6 +554,8 @@ fn main() -> Result<()> {
                 },
                 hinter: Some(rustyline::hint::HistoryHinter {}),
             }));
+
+            let _ = line_editor.load_history(&history_path);
 
             // let line_editor = Reedline::create()
             //     .into_diagnostic()?
@@ -528,11 +620,15 @@ fn main() -> Result<()> {
 
             entry_num += 1;
 
+            let cwd = std::env::current_dir().expect("can't get dir");
             // let input = line_editor.read_line(prompt);
-            let input = line_editor.readline("> ");
+            let input =
+                line_editor.readline(&default_prompt_string(cwd.to_str().expect("can't get dir")));
             match input {
                 //Ok(Signal::Success(mut s)) => {
                 Ok(mut s) => {
+                    line_editor.add_history_entry(&s);
+                    let _ = line_editor.append_history(&history_path);
                     // Check if this is a single call to a directory, if so auto-cd
                     let path = nu_path::expand_path(&s);
                     let orig = s.clone();
